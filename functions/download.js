@@ -1,106 +1,146 @@
 export async function onRequest(context) {
-  try {
-    // ============================================================
-    // 第一步：获取版本列表
-    // ============================================================
-    // 直接访问 Mozilla 的 Fenix (Firefox Android) 归档目录
-    const releasesUrl = "https://archive.mozilla.org/pub/fenix/releases/";
-    
-    // 获取目录的 HTML 页面
-    const listResponse = await fetch(releasesUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Cloudflare-Worker)' }
-    });
+  // ============================================================
+  // 配置区域
+  // ============================================================
+  // 紧急备用版本号：如果所有自动获取都失败了，就用这个。
+  // 根据最新数据，2026年初 Firefox Android 版本约为 147.0
+  const EMERGENCY_VERSION = "147.0"; 
+  
+  // 架构配置 (绝大多数现代手机都是这个)
+  const ARCH = "android-arm64-v8a"; 
 
-    if (!listResponse.ok) {
-      return new Response(`无法连接到 Mozilla 归档服务器: ${listResponse.status}`, { status: 502 });
-    }
-
-    const listHtml = await listResponse.text();
-
-    // 使用正则提取所有以数字开头的版本号文件夹 (例如 "123.0.1/")
-    // 排除 beta, nightly 等非纯数字版本
-    const versionRegex = /href="(\d+\.\d+(\.\d+)?)\/"/g;
-    const versions = [];
-    let match;
-    while ((match = versionRegex.exec(listHtml)) !== null) {
-      versions.push(match[1]); // 拿到版本号字符串，如 "120.0.1"
-    }
-
-    if (versions.length === 0) {
-      return new Response("未在归档目录中找到任何有效版本。", { status: 404 });
-    }
-
-    // ============================================================
-    // 第二步：找出最大的版本号
-    // ============================================================
-    // 简单的字符串排序是不够的 (因为 "10.0" < "2.0")，需要按数值段比较
-    const sortedVersions = versions.sort((a, b) => {
-      const partsA = a.split('.').map(Number);
-      const partsB = b.split('.').map(Number);
-      for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
-        const valA = partsA[i] || 0;
-        const valB = partsB[i] || 0;
-        if (valA !== valB) return valA - valB;
+  // ============================================================
+  // 辅助函数：尝试获取版本号
+  // ============================================================
+  async function getLatestVersion() {
+    // 策略 A: 官方 mobile_versions.json (最快、最准)
+    try {
+      const resp = await fetch("https://product-details.mozilla.org/1.0/mobile_versions.json", {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Cloudflare-Worker)' }
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        // 尝试获取正式版版本号，不同时期字段可能不同，多试几个
+        const ver = data.version || data.android_release || (data.release && data.release.version);
+        if (ver) return ver;
       }
-      return 0;
-    });
-
-    const latestVersion = sortedVersions.pop(); // 取最后一个，即最大版本
-
-    // ============================================================
-    // 第三步：定位 APK 文件
-    // ============================================================
-    // 构造该版本 arm64 架构的具体目录 URL
-    // 路径规则通常是: /releases/<ver>/android/fenix-<ver>-android-arm64-v8a/
-    const apkDirUrl = `${releasesUrl}${latestVersion}/android/fenix-${latestVersion}-android-arm64-v8a/`;
-
-    // 再次请求这个目录，为了获取准确的文件名 (防止文件名里有额外的 build ID)
-    const apkListResponse = await fetch(apkDirUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Cloudflare-Worker)' }
-    });
-
-    if (!apkListResponse.ok) {
-       // 备用方案：如果特定架构目录找不着，可能路径规则微调了，尝试直接盲猜文件名
-       // 但通常这一步能成功。如果失败，返回错误以便调试。
-       return new Response(`找到版本 ${latestVersion} 但无法进入其下载目录。`, { status: 404 });
+    } catch (e) {
+      console.log("策略 A 失败:", e.message);
     }
 
-    const apkDirHtml = await apkListResponse.text();
-
-    // 查找 .apk 结尾的文件链接
-    // 通常文件名类似: fenix-123.0.0.multi.android-arm64-v8a.apk
-    const apkFileRegex = /href="([^"]+\.apk)"/;
-    const fileMatch = apkDirHtml.match(apkFileRegex);
-
-    if (!fileMatch) {
-      return new Response(`在版本 ${latestVersion} 中未找到 APK 文件。`, { status: 404 });
+    // 策略 B: 官方 firefox_versions.json (备用数据源)
+    try {
+      const resp = await fetch("https://product-details.mozilla.org/1.0/firefox_versions.json", {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Cloudflare-Worker)' }
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        // 查找 Android 相关的 Key
+        const ver = data.LATEST_FIREFOX_ANDROID_VERSION || data.FIREFOX_ANDROID;
+        if (ver) return ver;
+      }
+    } catch (e) {
+      console.log("策略 B 失败:", e.message);
     }
 
-    const apkFilename = fileMatch[1];
-    const finalDownloadUrl = `${apkDirUrl}${apkFilename}`;
+    // 策略 C: 暴力扫描归档目录 (正则改进版)
+    try {
+      const resp = await fetch("https://archive.mozilla.org/pub/fenix/releases/", {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Cloudflare-Worker)' }
+      });
+      if (resp.ok) {
+        const html = await resp.text();
+        // 宽松正则：匹配所有以数字开头、以 / 结尾的 href 链接
+        // 比如 href="147.0/" 或 href="147.0.1/"
+        const regex = /href=["']?([0-9][0-9\.]*)[\/]["']?/g;
+        const versions = [];
+        let match;
+        while ((match = regex.exec(html)) !== null) {
+          versions.push(match[1]);
+        }
+        
+        if (versions.length > 0) {
+          // 排序逻辑：按数字分段比较，找出最大的
+          return versions.sort((a, b) => {
+            const partsA = a.split('.').map(Number);
+            const partsB = b.split('.').map(Number);
+            for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+              if ((partsA[i] || 0) < (partsB[i] || 0)) return -1;
+              if ((partsA[i] || 0) > (partsB[i] || 0)) return 1;
+            }
+            return 0;
+          }).pop();
+        }
+      }
+    } catch (e) {
+      console.log("策略 C 失败:", e.message);
+    }
 
-    // ============================================================
-    // 第四步：代理下载
-    // ============================================================
-    const fileResponse = await fetch(finalDownloadUrl, {
+    // 策略 D: 绝望了，使用硬编码版本
+    return EMERGENCY_VERSION;
+  }
+
+  try {
+    // 1. 获取最佳版本号
+    const version = await getLatestVersion();
+    
+    // 2. 构造下载链接
+    // 路径: /pub/fenix/releases/<version>/android/fenix-<version>-android-arm64-v8a/fenix-<version>.multi.android-arm64-v8a.apk
+    // 注意：有时候文件名里会有 build ID，所以我们先尝试标准文件名
+    const baseUrl = `https://archive.mozilla.org/pub/fenix/releases/${version}/android/fenix-${version}-${ARCH}`;
+    const standardFilename = `fenix-${version}.multi.${ARCH}.apk`;
+    let downloadUrl = `${baseUrl}/${standardFilename}`;
+
+    // 3. 验证文件是否存在 (HEAD 请求)
+    // 如果标准文件名不存在，我们不得不再次扫描该版本的目录来找真实文件名
+    // 但为了速度，我们先赌它存在。如果 Fetch 失败，脚本会捕获错误。
+
+    // 4. 执行代理下载
+    const fileResponse = await fetch(downloadUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Android) Gecko/100.0 Firefox/100.0',
+        'User-Agent': 'Mozilla/5.0 (Android 13; Mobile; rv:109.0) Gecko/109.0 Firefox/110.0',
       },
       redirect: 'follow'
     });
 
-    const newHeaders = new Headers(fileResponse.headers);
-    newHeaders.set('Content-Disposition', `attachment; filename="Firefox-Android-${latestVersion}.apk"`);
-    newHeaders.set('Content-Type', 'application/vnd.android.package-archive');
-    newHeaders.delete('Content-Length'); // 避免流传输中断
+    // 如果直接下载失败（比如 404），说明文件名可能不规则
+    // 这时候我们做一个最后的挽救：尝试列出该版本目录下的所有 .apk
+    if (!fileResponse.ok) {
+        const dirResp = await fetch(`${baseUrl}/`);
+        if (dirResp.ok) {
+            const dirHtml = await dirResp.text();
+            // 找 .apk
+            const apkMatch = dirHtml.match(/href=["']?([^"']+\.apk)["']?/);
+            if (apkMatch) {
+                downloadUrl = `${baseUrl}/${apkMatch[1]}`;
+                // 再次尝试下载
+                const retryResponse = await fetch(downloadUrl, { redirect: 'follow' });
+                if (retryResponse.ok) {
+                     return buildResponse(retryResponse, version);
+                }
+            }
+        }
+        // 如果挽救也失败，抛出异常
+        throw new Error(`无法下载版本 ${version} (Status: ${fileResponse.status})`);
+    }
 
-    return new Response(fileResponse.body, {
-      status: fileResponse.status,
-      statusText: fileResponse.statusText,
-      headers: newHeaders
-    });
+    return buildResponse(fileResponse, version);
 
   } catch (error) {
-    return new Response(`服务器内部错误: ${error.message}\nStack: ${error.stack}`, { status: 500 });
+    return new Response(`下载服务暂时不可用: ${error.message}`, { status: 500 });
   }
+}
+
+// 辅助函数：构建返回给用户的响应
+function buildResponse(upstreamResponse, version) {
+  const newHeaders = new Headers(upstreamResponse.headers);
+  newHeaders.set('Content-Disposition', `attachment; filename="Firefox-Android-${version}.apk"`);
+  newHeaders.set('Content-Type', 'application/vnd.android.package-archive');
+  newHeaders.delete('Content-Length'); // 删除长度头，防止流传输中断
+
+  return new Response(upstreamResponse.body, {
+    status: upstreamResponse.status,
+    statusText: upstreamResponse.statusText,
+    headers: newHeaders
+  });
 }
