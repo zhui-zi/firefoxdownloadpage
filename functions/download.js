@@ -1,63 +1,59 @@
 export async function onRequest(context) {
-  // 1. 设置 GitHub API 地址
-  const releasesUrl = "https://api.github.com/repos/mozilla-mobile/firefox-android/releases";
-  
   try {
-    // 2. 请求 GitHub API 获取发布列表
-    const apiResponse = await fetch(releasesUrl, {
-      headers: {
-        'User-Agent': 'Cloudflare-Workers-Firefox-Proxy', // GitHub 要求必须有 UA
-        'Accept': 'application/vnd.github.v3+json'
-      }
+    // 1. 获取 Mozilla 官方的版本信息 JSON (这是静态文件，无速率限制)
+    // 这里的 mobile_versions.json 包含了安卓版的最新版本号
+    const versionUrl = "https://product-details.mozilla.org/1.0/mobile_versions.json";
+    
+    const versionResponse = await fetch(versionUrl, {
+      headers: { 'User-Agent': 'Cloudflare-Workers-Firefox-Proxy' }
     });
 
-    if (!apiResponse.ok) {
-      throw new Error(`GitHub API Error: ${apiResponse.status}`);
+    if (!versionResponse.ok) {
+      throw new Error(`Mozilla Version API Error: ${versionResponse.status}`);
     }
 
-    const releases = await apiResponse.json();
-
-    // 3. 筛选最新的正式版 (排除 pre-release/beta)
-    // 并且该版本必须包含 arm64-v8a 的 apk 文件
-    const latestRelease = releases.find(release => 
-      !release.prerelease && 
-      release.assets.some(asset => 
-        asset.name.includes('arm64-v8a') && 
-        asset.name.endsWith('.apk') &&
-        asset.name.includes('fenix') // fenix 是 Firefox 安卓版的代号
-      )
-    );
-
-    if (!latestRelease) {
-      return new Response("未找到最新的正式版 APK，请稍后再试。", { status: 404 });
-    }
-
-    // 4. 提取下载链接和文件名
-    const asset = latestRelease.assets.find(a => 
-      a.name.includes('arm64-v8a') && 
-      a.name.endsWith('.apk') && 
-      a.name.includes('fenix')
-    );
+    const versions = await versionResponse.json();
     
-    const downloadUrl = asset.browser_download_url;
-    const fileName = asset.name;
+    // 2. 提取最新的 Android 正式版版本号
+    // 通常 key 是 "alpha" / "beta" / "nightly" / "version"
+    // 我们找最新的 release 版本。或者使用 firefox_versions.json 中的 LATEST_FIREFOX_ANDROID_VERSION
+    // 为保险起见，我们换用更通用的 firefox_versions.json
+    const v2Url = "https://product-details.mozilla.org/1.0/firefox_versions.json";
+    const v2Resp = await fetch(v2Url);
+    const v2Json = await v2Resp.json();
+    
+    const latestVersion = v2Json.LATEST_FIREFOX_ANDROID_VERSION;
 
-    // 5. 开始代理下载 (从 GitHub 下载流转发给用户)
-    // 这样用户连接的是 Cloudflare，由 Cloudflare 去连接 GitHub，解决墙的问题
+    if (!latestVersion) {
+      return new Response("无法获取最新版本号", { status: 500 });
+    }
+
+    // 3. 构造 Mozilla Archive (归档服务器) 的直接下载链接
+    // 路径规则: /pub/fenix/releases/<版本号>/android/fenix-<版本号>-android-arm64-v8a/fenix-<版本号>.multi.android-arm64-v8a.apk
+    // "fenix" 是 Firefox Android 的内部代号
+    const downloadUrl = `https://archive.mozilla.org/pub/fenix/releases/${latestVersion}/android/fenix-${latestVersion}-android-arm64-v8a/fenix-${latestVersion}.multi.android-arm64-v8a.apk`;
+    
+    const fileName = `Firefox-Android-${latestVersion}.apk`;
+
+    // 4. 代理下载 (Cloudflare -> Mozilla Archive -> 用户)
     const fileResponse = await fetch(downloadUrl, {
       headers: {
-        'User-Agent': 'Cloudflare-Workers-Firefox-Proxy'
+        'User-Agent': 'Mozilla/5.0 (Android) Gecko/100.0 Firefox/100.0',
       },
       redirect: 'follow'
     });
 
-    // 6. 组装响应头，强制浏览器下载文件
+    if (!fileResponse.ok) {
+      // 如果 arm64 路径不对，可能是版本命名规则微调，尝试通用路径或报错
+      // 但 standard release 结构非常固定，通常不会错
+      return new Response(`文件下载失败 (Mozilla Archive): ${fileResponse.status}`, { status: 404 });
+    }
+
+    // 5. 返回文件流
     const newHeaders = new Headers(fileResponse.headers);
     newHeaders.set('Content-Disposition', `attachment; filename="${fileName}"`);
     newHeaders.set('Content-Type', 'application/vnd.android.package-archive');
-    
-    // 删除 Content-Length，因为流式传输可能不准确，避免下载中断
-    newHeaders.delete('Content-Length');
+    newHeaders.delete('Content-Length'); // 避免流传输中断
 
     return new Response(fileResponse.body, {
       status: fileResponse.status,
